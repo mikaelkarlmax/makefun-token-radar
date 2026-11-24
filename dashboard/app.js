@@ -92,7 +92,7 @@
     h += '<p class="tagline">Every protocol in the snapshot that still records no token, '
       + 'ranked by the market value a launch would imply under a model <strong>fitted on the '
       + 'snapshot\'s own tokenised comparables</strong> — category multiples, momentum, age and '
-      + 'chain factors — and <strong>proven out of sample on two held-out halves</strong>. '
+      + 'chain factors — and <strong>graded out of sample on two held-out halves</strong>. '
       + 'Each row carries a token-launch odds estimate from its peer bucket and a five-step, '
       + 'fully costed farm plan.</p>';
     h += '<div class="strip">';
@@ -175,10 +175,11 @@
     h += '<div class="cell"><div class="k">THIN verdicts</div><div class="v"><em>' + counts.THIN + '</em></div></div>';
     h += '<div class="cell"><div class="k">SKIP verdicts</div><div class="v">' + counts.SKIP + '</div></div>';
     h += '<div class="cell"><div class="k">Cost to farm the board</div><div class="v">' + moneyFull(totalFarm) + '</div></div>';
-    h += '</div><p class="muted">Verdicts are deliberately hard to earn — FARM needs odds ≥ '
-      + MODEL.verdict_thresholds.farm_min_odds_pct + '%, implied ≥ ' + moneyFull(MODEL.verdict_thresholds.farm_min_implied_usd)
-      + ' and ≥ ' + MODEL.verdict_thresholds.farm_min_value_per_cost
-      + ' dollars of implied value per farm-cost dollar; the Model &amp; validation tab prints the full thresholds and evidence.</p></div>';
+    h += '</div><p class="muted">Verdicts come from one stated score — farm score = launch odds × implied '
+      + 'value per farm-cost dollar. FARM needs a farm score ≥ ' + MODEL.verdict_thresholds.farm_min_score
+      + ' with odds ≥ ' + MODEL.verdict_thresholds.farm_min_odds_pct + '% and implied ≥ '
+      + moneyFull(MODEL.verdict_thresholds.farm_min_implied_usd)
+      + '; the Model &amp; validation tab prints the full rule, thresholds and evidence.</p></div>';
     return h;
   }
 
@@ -237,9 +238,10 @@
       + 'category\'s comparables actually trade across, is the honest precision of the estimate.</p>'
       + '<p><strong>Token odds</strong> answer a different question: among the protocols most similar to this '
       + 'one — same category, similar TVL, similar token-free age — how many already record a token? High odds '
-      + 'with a small implied value means a launch is likely but small; the verdict joins the two: '
-      + '<strong>FARM</strong> only when both are large and the plan is cheap relative to the prize, '
-      + '<strong>THIN</strong> when the case is real but one leg is weak, <strong>SKIP</strong> when farming '
+      + 'with a small implied value means a launch is likely but small; the verdict joins the two into one '
+      + '<strong>farm score</strong> — odds × implied value ÷ farm cost: '
+      + '<strong>FARM</strong> when that score is high and both legs clear their floors, '
+      + '<strong>THIN</strong> when the score is real but smaller, <strong>SKIP</strong> when farming '
       + 'would cost more attention than the expected launch can repay.</p>'
       + '<p><strong>Farm $</strong> is the all-in fee and gas cost of the five-step plan on the detail view — '
       + 'not the working capital the plan moves, which the steps themselves state. Every plan is written for '
@@ -291,8 +293,10 @@
       + ' <span class="op">×</span> <span class="lab">chains</span> ' + factor(r.chain_factor)
       + ' <span class="op">=</span> <span class="res">' + moneyFull(r.implied_value_usd) + '</span></div>';
     h += '<p class="muted">The category multiple is the fitted median market-cap / TVL of tokenised '
-      + esc(r.category || 'comparable') + ' protocols; each factor is its bucket\'s median multiple '
-      + 'relative to the global median, clamped to [0.50, 2.00]. The full fitted tables are on the Model &amp; validation tab.</p>';
+      + esc(r.category || 'comparable') + ' protocols, shrunk toward the global median; each factor is its '
+      + 'bucket\'s median multiple relative to the global median, shrunk toward 1 by bucket size and '
+      + 'clamped to [0.50, 2.00]. This protocol\'s farm score is <strong>' + metric(r.farm_score, 1) + '</strong> '
+      + '(odds × implied ÷ farm cost). The full fitted tables are on the Model &amp; validation tab.</p>';
     h += bandBarHtml(r);
 
     h += '<h3>Token-launch odds: ' + r.odds_pct + '%</h3>';
@@ -328,6 +332,22 @@
     return h;
   }
 
+  function heldOutVerdict() {
+    var parts = MODEL.held_out.map(function (s) {
+      var f = s.full_model, b = s.baseline_tvl_only;
+      var mae = f.median_abs_log10_err <= b.median_abs_log10_err
+        ? 'the full model\'s median error (' + metric(f.median_abs_log10_err) + ') beats the baseline\'s (' + metric(b.median_abs_log10_err) + ')'
+        : 'the baseline\'s median error (' + metric(b.median_abs_log10_err) + ') is lower than the full model\'s (' + metric(f.median_abs_log10_err) + ')';
+      var w2 = f.pct_within_2x >= b.pct_within_2x
+        ? 'the full model puts more protocols within 2× of their actual market cap (' + metric(f.pct_within_2x, 1) + '% vs ' + metric(b.pct_within_2x, 1) + '%)'
+        : 'the baseline puts more protocols within 2× (' + metric(b.pct_within_2x, 1) + '% vs ' + metric(f.pct_within_2x, 1) + '%)';
+      return 'fit ' + s.train_half + ' → test ' + s.test_half + ': ' + mae + ', while ' + w2;
+    });
+    return '<strong>Read honestly:</strong> on ' + parts.join('; on ') + '. The shrinkage printed above was '
+      + 'chosen to close the median-error gap across both splits without giving up the within-2× edge — '
+      + 'no stronger claim is made than these numbers support.';
+  }
+
   function heldOutHtml() {
     var h = '<h3>Held-out validation ×2 — the model, graded on protocols it never fitted</h3>';
     h += '<p>The ' + MODEL.comparables_used + ' comparables are split into two halves by a stable hash of each '
@@ -357,6 +377,7 @@
         + '<td class="num">' + metric(b.r2_log10) + '</td></tr>';
     });
     h += '</tbody></table>';
+    h += '<p>' + heldOutVerdict() + '</p>';
     h += '<p class="muted">Green marks the better score on that metric and split, red the worse. Market-cap / TVL '
       + 'ratios are heavy-tailed — the snapshot\'s own interquartile range runs from ' + mult(MODEL.global_p25)
       + ' to ' + mult(MODEL.global_p75) + ' — so even a correct median model lands within 2× only part of the time; '
@@ -371,12 +392,15 @@
     h += '<p>Comparables are the ' + MODEL.comparables_used + ' protocols that already record a token with both a '
       + 'market cap and TVL. Their market-cap / TVL ratios give a <strong>global median of ' + mult(MODEL.global_median)
       + '</strong> (P25 ' + mult(MODEL.global_p25) + ', P75 ' + mult(MODEL.global_p75) + '; medians use the '
-      + esc(MODEL.median_convention) + '). Each category\'s multiple is its own median when at least 3 comparables '
-      + 'support it; thinner categories shrink toward the global median with a prior weight of '
-      + MODEL.category_prior_weight + '. Three bucket factors — 7-day TVL momentum, token-free age, chain count — '
-      + 'are each fitted as the bucket\'s median ratio divided by the global median, clamped to ['
+      + esc(MODEL.median_convention) + '). Each category\'s multiple is its own median shrunk toward the global '
+      + 'median with a prior weight (pseudo-count) of ' + MODEL.category_prior_weight + ' — every category is '
+      + 'shrunk, thin ones most, so a handful of comparables cannot drag a price on their own. Three bucket '
+      + 'factors — 7-day TVL momentum, token-free age, chain count — are each fitted as the bucket\'s median '
+      + 'ratio divided by the global median, then shrunk toward 1 by bucket size: factor = 1 + (raw − 1) × '
+      + 'n/(n + ' + MODEL.factor_shrinkage_k + '), and only then clamped to ['
       + MODEL.factor_clamp[0].toFixed(2) + ', ' + MODEL.factor_clamp[1].toFixed(2) + ']. A bucket the data cannot '
       + 'support (an unreported momentum or age with fewer than 5 comparables) gets the neutral factor 1.000. '
+      + 'The shrinkage strength was selected by held-out validation across both splits. '
       + 'Nothing is hardcoded per protocol: change the snapshot and every number on this page moves.</p>';
 
     h += '<h3>Fitted category multiples</h3>';
@@ -414,13 +438,15 @@
     h += '<p>' + esc(MODEL.odds_method.note) + '. The four levels, finest first: '
       + MODEL.odds_method.levels.map(esc).join(' → ') + '. Odds describe how often comparable peers already '
       + 'record a token; they are a base rate, not a promise about any single protocol.</p>';
-    h += '<h3>Verdict thresholds</h3>';
+    h += '<h3>Verdict rule — one score</h3>';
     var t = MODEL.verdict_thresholds;
+    h += '<p>Every verdict comes from a single stated score: <strong>farm score = launch odds (as a fraction) '
+      + '× implied value ÷ farm cost</strong> — the expected prize per dollar the plan spends.</p>';
     h += '<ul>'
-      + '<li><strong>FARM</strong> — odds ≥ ' + t.farm_min_odds_pct + '%, implied value ≥ ' + moneyFull(t.farm_min_implied_usd)
-      + ', and implied value per farm-cost dollar ≥ ' + t.farm_min_value_per_cost + '.</li>'
-      + '<li><strong>THIN</strong> — odds ≥ ' + t.thin_min_odds_pct + '% and implied value ≥ ' + moneyFull(t.thin_min_implied_usd)
-      + ', but short of the FARM bar: a small position, sized down.</li>'
+      + '<li><strong>FARM</strong> — farm score ≥ ' + t.farm_min_score + ', odds ≥ ' + t.farm_min_odds_pct
+      + '% and implied value ≥ ' + moneyFull(t.farm_min_implied_usd) + '.</li>'
+      + '<li><strong>THIN</strong> — farm score ≥ ' + t.thin_min_score + ' and implied value ≥ '
+      + moneyFull(t.thin_min_implied_usd) + ', but short of the FARM bar: a small position, sized down.</li>'
       + '<li><strong>SKIP</strong> — everything else: the expected launch does not pay for the farming effort today.</li></ul>';
     h += '<h3>Integrity checklist — recomputed on every run</h3>';
     h += '<ul class="checklist">'

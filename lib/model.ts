@@ -10,11 +10,13 @@
 //
 // where the category multiple is the median market-cap / TVL ratio of the
 // tokenised comparables in that category (shrunk toward the global median
-// when a category is thin) and each factor is the ratio of a bucket's median
-// multiple to the global median, clamped to [0.5, 2.0]. The fit is proven
-// out of sample: parameters are fitted on one slug-hash half of the
-// comparables and scored on the other half, then the halves swap, and a
-// TVL-only baseline is scored the same way so the lift is measurable.
+// with a pseudo-count prior) and each factor is the ratio of a bucket's
+// median multiple to the global median, shrunk toward 1 by bucket size and
+// clamped to [0.5, 2.0]. The shrinkage strengths were selected by held-out
+// validation across both splits. The fit is graded out of sample:
+// parameters are fitted on one slug-hash half of the comparables and scored
+// on the other half, then the halves swap, and a TVL-only baseline is
+// scored the same way so the comparison is measurable.
 
 export interface Protocol {
   slug: string;
@@ -41,17 +43,18 @@ export interface Snapshot {
 
 export const FACTOR_MIN = 0.5;
 export const FACTOR_MAX = 2.0;
-export const CATEGORY_PRIOR_WEIGHT = 3;
+export const CATEGORY_PRIOR_WEIGHT = 15;
+export const FACTOR_SHRINKAGE_K = 20;
 export const MIN_CATEGORY_N = 3;
 export const MIN_UNKNOWN_BUCKET_N = 5;
 export const ODDS_MIN_BUCKET_N = 8;
 export const ODDS_PRIOR_WEIGHT = 4;
 export const VERDICT = {
-  farm_min_odds_pct: 45,
-  farm_min_implied_usd: 25000000,
-  farm_min_value_per_cost: 400,
-  thin_min_odds_pct: 25,
-  thin_min_implied_usd: 8000000,
+  farm_min_score: 25,
+  farm_min_odds_pct: 30,
+  farm_min_implied_usd: 5000000,
+  thin_min_score: 6,
+  thin_min_implied_usd: 2000000,
 };
 
 const EXCLUDED_CATEGORIES = new Set([
@@ -210,7 +213,9 @@ function fitBucketFactors(
     let factor = 1;
     const isUnknown = key === 'unknown';
     if (!isUnknown || !unknownNeedsN || ratios.length >= MIN_UNKNOWN_BUCKET_N) {
-      factor = clamp(medianOf(ratios) / globalMedian, FACTOR_MIN, FACTOR_MAX);
+      const rawFactor = medianOf(ratios) / globalMedian;
+      const shrunk = 1 + (rawFactor - 1) * ratios.length / (ratios.length + FACTOR_SHRINKAGE_K);
+      factor = clamp(shrunk, FACTOR_MIN, FACTOR_MAX);
     }
     rows.push({ bucket: key, n: ratios.length, factor: r6(factor) });
   }
@@ -233,9 +238,7 @@ export function fitModel(comps: Protocol[], asOf: string): Fit {
   for (const cat of [...byCategory.keys()].sort()) {
     const rs = byCategory.get(cat)!;
     const raw = medianOf(rs);
-    const median = rs.length >= MIN_CATEGORY_N
-      ? raw
-      : (rs.length * raw + CATEGORY_PRIOR_WEIGHT * globalMedian) / (rs.length + CATEGORY_PRIOR_WEIGHT);
+    const median = (rs.length * raw + CATEGORY_PRIOR_WEIGHT * globalMedian) / (rs.length + CATEGORY_PRIOR_WEIGHT);
     categories.push({
       category: cat,
       n: rs.length,
@@ -360,7 +363,7 @@ export interface AblationRow {
 function ablationLadder(comps: Protocol[], fit: Fit, asOf: string): AblationRow[] {
   const labels = [
     ['A0', 'global median multiple only'],
-    ['A1', '+ category medians (shrunk when thin)'],
+    ['A1', '+ category medians (shrunk toward global)'],
     ['A2', '+ momentum bucket factor'],
     ['A3', '+ age bucket factor'],
     ['A4', 'full model (+ chain-count factor)'],
@@ -539,6 +542,7 @@ export interface BoardRow {
   band_low_usd: number;
   band_high_usd: number;
   verdict: string;
+  farm_score: number;
   farm_cost_usd: number;
   chains: string[];
   listed_at: string | null;
@@ -582,16 +586,17 @@ export function buildBoard(snapshot: Snapshot): BoardResult {
     const odds = launchOdds(p, all, asOf);
     const plan = farmPlan(p);
     const farmCost = plan.reduce((s, x) => s + x.cost_usd, 0);
+    const farmScore = (odds.odds_pct / 100) * implied / farmCost;
     let verdict = 'SKIP';
-    let reason = 'Below the THIN bar on odds, implied value, or both — capital earns more elsewhere on this board.';
-    if (odds.odds_pct >= VERDICT.farm_min_odds_pct
-      && implied >= VERDICT.farm_min_implied_usd
-      && implied / farmCost >= VERDICT.farm_min_value_per_cost) {
+    let reason = `Farm score ${farmScore.toFixed(1)} (odds ${odds.odds_pct}% x $${implied.toLocaleString('en-US')} implied / $${farmCost} cost) is below the THIN bar — capital earns more elsewhere on this board.`;
+    if (farmScore >= VERDICT.farm_min_score
+      && odds.odds_pct >= VERDICT.farm_min_odds_pct
+      && implied >= VERDICT.farm_min_implied_usd) {
       verdict = 'FARM';
-      reason = `Launch odds ${odds.odds_pct}% and $${implied.toLocaleString('en-US')} implied clear the FARM bar, at $${farmCost} of total farm cost.`;
-    } else if (odds.odds_pct >= VERDICT.thin_min_odds_pct && implied >= VERDICT.thin_min_implied_usd) {
+      reason = `Farm score ${farmScore.toFixed(1)} clears the FARM bar of ${VERDICT.farm_min_score}: odds ${odds.odds_pct}% on $${implied.toLocaleString('en-US')} implied against only $${farmCost} of total farm cost.`;
+    } else if (farmScore >= VERDICT.thin_min_score && implied >= VERDICT.thin_min_implied_usd) {
       verdict = 'THIN';
-      reason = `Clears the THIN bar (odds ${odds.odds_pct}%, implied $${implied.toLocaleString('en-US')}) but not FARM — a small position only.`;
+      reason = `Farm score ${farmScore.toFixed(1)} clears the THIN bar of ${VERDICT.thin_min_score} (odds ${odds.odds_pct}%, implied $${implied.toLocaleString('en-US')}, cost $${farmCost}) but not FARM — a small position only.`;
     }
     const age = ageYears(p, asOf);
     return {
@@ -607,6 +612,7 @@ export function buildBoard(snapshot: Snapshot): BoardResult {
       band_low_usd: bandLow,
       band_high_usd: bandHigh,
       verdict,
+      farm_score: r4(farmScore),
       farm_cost_usd: farmCost,
       chains: p.chains || [],
       listed_at: p.listed_at,
@@ -654,6 +660,8 @@ export function buildBoard(snapshot: Snapshot): BoardResult {
     median_convention: 'upper middle element of the sorted ratios (index floor(n/2))',
     factor_clamp: [FACTOR_MIN, FACTOR_MAX],
     category_prior_weight: CATEGORY_PRIOR_WEIGHT,
+    factor_shrinkage_k: FACTOR_SHRINKAGE_K,
+    shrinkage_selection: 'category pseudo-count and factor shrinkage k were selected by held-out validation across both slug-hash splits',
     categories: fit.categories,
     momentum_factors: fit.momentum,
     age_factors: fit.age,

@@ -74,6 +74,7 @@ function run(): void {
     band_low_usd: r.band_low_usd,
     band_high_usd: r.band_high_usd,
     verdict: r.verdict,
+    farm_score: r.farm_score,
     farm_cost_usd: r.farm_cost_usd,
   }));
   writeFileSync(join(opts.output, 'board.json'), JSON.stringify({ rows: boardRows }) + '\n');
