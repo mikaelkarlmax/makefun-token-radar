@@ -1,15 +1,20 @@
-// Token Launch Radar — valuation model.
-// Ranks pre-token protocols by the market value a token launch would imply,
-// using the market-cap / TVL ratios of already-tokenised comparables.
-
-export const MOMENTUM_PER_PCT = 0.006;
-export const MOMENTUM_MIN = 0.7;
-export const MOMENTUM_MAX = 1.4;
-export const AGE_PER_YEAR = 0.05;
-export const AGE_MAX_YEARS = 6;
-export const CHAIN_PER_EXTRA = 0.03;
-export const CHAIN_MAX_EXTRA = 5;
-export const MIN_CATEGORY_COMPARABLES = 3;
+// Token Launch Radar v2 — valuation model.
+//
+// Every number on the board is fitted from the snapshot itself, in this file,
+// deterministically: no clocks, no randomness, and the one train/test split
+// is decided by a stable hash of each protocol's slug. The model prices a
+// pre-token protocol at
+//
+//   implied value = TVL x category multiple x momentum factor
+//                     x age factor x chain factor
+//
+// where the category multiple is the median market-cap / TVL ratio of the
+// tokenised comparables in that category (shrunk toward the global median
+// when a category is thin) and each factor is the ratio of a bucket's median
+// multiple to the global median, clamped to [0.5, 2.0]. The fit is proven
+// out of sample: parameters are fitted on one slug-hash half of the
+// comparables and scored on the other half, then the halves swap, and a
+// TVL-only baseline is scored the same way so the lift is measurable.
 
 export interface Protocol {
   slug: string;
@@ -32,479 +37,651 @@ export interface Snapshot {
   watchlist: string[];
 }
 
-interface Stats {
+// ------------------------------------------------------------------ tuning
+
+export const FACTOR_MIN = 0.5;
+export const FACTOR_MAX = 2.0;
+export const CATEGORY_PRIOR_WEIGHT = 3;
+export const MIN_CATEGORY_N = 3;
+export const MIN_UNKNOWN_BUCKET_N = 5;
+export const ODDS_MIN_BUCKET_N = 8;
+export const ODDS_PRIOR_WEIGHT = 4;
+export const VERDICT = {
+  farm_min_odds_pct: 45,
+  farm_min_implied_usd: 25000000,
+  farm_min_value_per_cost: 400,
+  thin_min_odds_pct: 25,
+  thin_min_implied_usd: 8000000,
+};
+
+const EXCLUDED_CATEGORIES = new Set([
+  'Bridge',
+  'Canonical Bridge',
+  'Liquid Staking',
+  'Liquid Restaking',
+  'Restaked BTC',
+  'CEX',
+]);
+const EXCHANGE_PREFIXES = [
+  'Binance', 'Coinbase', 'Bybit', 'Kraken',
+  'Bitget', 'OKX', 'Bitfinex', 'Gemini',
+];
+
+// ------------------------------------------------------------------ helpers
+
+function sortedNums(values: number[]): number[] {
+  return [...values].sort((a, b) => a - b);
+}
+
+/** Median as the upper middle element of the sorted values (index floor(n/2)). */
+export function medianOf(values: number[]): number {
+  const s = sortedNums(values);
+  return s[Math.floor(s.length / 2)];
+}
+
+/** Quantile with the same index convention as medianOf. */
+export function quantileOf(values: number[], q: number): number {
+  const s = sortedNums(values);
+  return s[Math.min(s.length - 1, Math.floor(q * s.length))];
+}
+
+function meanOf(values: number[]): number {
+  return values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, v));
+}
+
+function roundTo(v: number, places: number): number {
+  const f = 10 ** places;
+  return Math.round(v * f) / f;
+}
+const r6 = (v: number) => roundTo(v, 6);
+const r4 = (v: number) => roundTo(v, 4);
+
+/** FNV-1a 32-bit hash of a slug: the stable coin-flip for the held-out split. */
+export function slugHash(slug: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < slug.length; i++) {
+    h ^= slug.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function daysBetween(fromIso: string, toIso: string): number {
+  const a = Date.parse(fromIso + 'T00:00:00Z');
+  const b = Date.parse(toIso + 'T00:00:00Z');
+  return Math.round((b - a) / 86400000);
+}
+
+/** Years since listed_at as of the snapshot date; null when unlisted. */
+export function ageYears(p: Protocol, asOf: string): number | null {
+  if (!p.listed_at) return null;
+  return daysBetween(p.listed_at, asOf) / 365.25;
+}
+
+// ------------------------------------------------------------------ buckets
+
+export function momentumBucket(change7d: number | null): string {
+  if (change7d === null) return 'unknown';
+  if (change7d < -2) return 'falling (7d < -2%)';
+  if (change7d > 2) return 'rising (7d > +2%)';
+  return 'flat (7d -2% to +2%)';
+}
+
+export function ageBucket(p: Protocol, asOf: string): string {
+  const age = ageYears(p, asOf);
+  if (age === null) return 'unknown';
+  if (age < 1) return 'under 1y token-free';
+  if (age < 3) return '1-3y token-free';
+  return 'over 3y token-free';
+}
+
+export function chainBucket(p: Protocol): string {
+  const n = (p.chains || []).length;
+  if (n <= 1) return '1 chain';
+  if (n <= 3) return '2-3 chains';
+  return '4+ chains';
+}
+
+export function tvlBand(tvl: number): string {
+  if (tvl < 10000000) return 'TVL under $10M';
+  if (tvl < 50000000) return 'TVL $10-50M';
+  return 'TVL $50M+';
+}
+
+export function ageBand(p: Protocol, asOf: string): string {
+  const age = ageYears(p, asOf);
+  if (age === null) return 'age unknown';
+  if (age < 1) return 'age under 1y';
+  if (age < 3) return 'age 1-3y';
+  return 'age over 3y';
+}
+
+// ------------------------------------------------------------------ fitting
+
+export interface CategoryFit {
+  category: string;
+  n: number;
   median: number;
+  raw_median: number;
   p25: number;
   p75: number;
+}
+
+export interface FactorRow {
+  bucket: string;
   n: number;
+  factor: number;
 }
 
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.min(hi, Math.max(lo, x));
+export interface Fit {
+  global_median: number;
+  global_p25: number;
+  global_p75: number;
+  comparables: number;
+  categories: CategoryFit[];
+  momentum: FactorRow[];
+  age: FactorRow[];
+  chains: FactorRow[];
 }
 
-function round4(x: number): number {
-  return Math.round(x * 10000) / 10000;
+function ratioOf(p: Protocol): number {
+  return (p.mcap_usd as number) / p.tvl_usd;
 }
 
-function round3(x: number): number {
-  return Math.round(x * 1000) / 1000;
+function fitBucketFactors(
+  comps: Protocol[],
+  keyOf: (p: Protocol) => string,
+  globalMedian: number,
+  unknownNeedsN: boolean,
+): FactorRow[] {
+  const byBucket = new Map<string, number[]>();
+  for (const p of comps) {
+    const key = keyOf(p);
+    if (!byBucket.has(key)) byBucket.set(key, []);
+    byBucket.get(key)!.push(ratioOf(p));
+  }
+  const rows: FactorRow[] = [];
+  for (const key of [...byBucket.keys()].sort()) {
+    const ratios = byBucket.get(key)!;
+    let factor = 1;
+    const isUnknown = key === 'unknown';
+    if (!isUnknown || !unknownNeedsN || ratios.length >= MIN_UNKNOWN_BUCKET_N) {
+      factor = clamp(medianOf(ratios) / globalMedian, FACTOR_MIN, FACTOR_MAX);
+    }
+    rows.push({ bucket: key, n: ratios.length, factor: r6(factor) });
+  }
+  return rows;
 }
 
-function quantileStats(values: number[]): Stats {
-  const sorted = [...values].sort((a, b) => a - b);
-  const n = sorted.length;
-  const median =
-    n % 2 === 1
-      ? sorted[(n - 1) / 2]
-      : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
-  const at = (q: number) =>
-    sorted[clamp(Math.floor(q * n), 0, n - 1)];
-  return { median, p25: at(0.25), p75: at(0.75), n };
+export function fitModel(comps: Protocol[], asOf: string): Fit {
+  const ratios = comps.map(ratioOf);
+  const globalMedian = medianOf(ratios);
+  const globalP25 = quantileOf(ratios, 0.25);
+  const globalP75 = quantileOf(ratios, 0.75);
+
+  const byCategory = new Map<string, number[]>();
+  for (const p of comps) {
+    const cat = p.category as string;
+    if (!byCategory.has(cat)) byCategory.set(cat, []);
+    byCategory.get(cat)!.push(ratioOf(p));
+  }
+  const categories: CategoryFit[] = [];
+  for (const cat of [...byCategory.keys()].sort()) {
+    const rs = byCategory.get(cat)!;
+    const raw = medianOf(rs);
+    const median = rs.length >= MIN_CATEGORY_N
+      ? raw
+      : (rs.length * raw + CATEGORY_PRIOR_WEIGHT * globalMedian) / (rs.length + CATEGORY_PRIOR_WEIGHT);
+    categories.push({
+      category: cat,
+      n: rs.length,
+      median: r6(median),
+      raw_median: r6(raw),
+      p25: r6(rs.length >= MIN_CATEGORY_N ? quantileOf(rs, 0.25) : globalP25),
+      p75: r6(rs.length >= MIN_CATEGORY_N ? quantileOf(rs, 0.75) : globalP75),
+    });
+  }
+
+  return {
+    global_median: r6(globalMedian),
+    global_p25: r6(globalP25),
+    global_p75: r6(globalP75),
+    comparables: comps.length,
+    categories,
+    momentum: fitBucketFactors(comps, (p) => momentumBucket(p.change_7d), globalMedian, true),
+    age: fitBucketFactors(comps, (p) => ageBucket(p, asOf), globalMedian, true),
+    chains: fitBucketFactors(comps, (p) => chainBucket(p), globalMedian, false),
+  };
 }
 
-function yearsBetween(from: string, to: string): number {
-  const ms = Date.parse(to + 'T00:00:00Z') - Date.parse(from + 'T00:00:00Z');
-  const days = Math.floor(ms / 86400000);
-  return days / 365.25;
+function categoryFit(fit: Fit, category: string | null): CategoryFit {
+  if (category !== null) {
+    const found = fit.categories.find((c) => c.category === category);
+    if (found) return found;
+  }
+  return {
+    category: category ?? '(none)',
+    n: 0,
+    median: fit.global_median,
+    raw_median: fit.global_median,
+    p25: fit.global_p25,
+    p75: fit.global_p75,
+  };
 }
 
-export function momentumFactor(change7d: number | null): number {
-  if (change7d === null) return 1;
-  return clamp(1 + change7d * MOMENTUM_PER_PCT, MOMENTUM_MIN, MOMENTUM_MAX);
+function factorFor(rows: FactorRow[], bucket: string): number {
+  const row = rows.find((r) => r.bucket === bucket);
+  return row ? row.factor : 1;
 }
 
-export function ageFactor(listedAt: string | null, asOf: string): number {
-  if (listedAt === null) return 1;
-  return 1 + AGE_PER_YEAR * Math.min(yearsBetween(listedAt, asOf), AGE_MAX_YEARS);
+/** Implied value of a protocol under a fit, using the first `level` factors. */
+function predictWith(fit: Fit, p: Protocol, asOf: string, level: number): number {
+  let v = p.tvl_usd * categoryFit(fit, p.category).median;
+  if (level >= 2) v *= factorFor(fit.momentum, momentumBucket(p.change_7d));
+  if (level >= 3) v *= factorFor(fit.age, ageBucket(p, asOf));
+  if (level >= 4) v *= factorFor(fit.chains, chainBucket(p));
+  return v;
 }
 
-export function chainsFactor(chainCount: number): number {
-  const extra = clamp(chainCount - 1, 0, CHAIN_MAX_EXTRA);
-  return 1 + CHAIN_PER_EXTRA * extra;
+// ------------------------------------------------------------------ scoring
+
+export interface ScoreMetrics {
+  n: number;
+  median_abs_log10_err: number;
+  mean_log10_err: number;
+  pct_within_2x: number;
+  r2_log10: number;
 }
 
-function sizeTier(tvl: number): string {
-  if (tvl >= 1_000_000_000) return '$1,000–$5,000';
-  if (tvl >= 100_000_000) return '$500–$2,500';
-  if (tvl >= 10_000_000) return '$250–$1,000';
-  return '$100–$500';
+function scorePredictions(pairs: { pred: number; actual: number }[]): ScoreMetrics {
+  const errs = pairs.map(({ pred, actual }) => Math.log10(pred) - Math.log10(actual));
+  const ys = pairs.map(({ actual }) => Math.log10(actual));
+  const yMean = meanOf(ys);
+  let ssRes = 0;
+  let ssTot = 0;
+  pairs.forEach(({ pred }, i) => {
+    ssRes += (ys[i] - Math.log10(pred)) ** 2;
+    ssTot += (ys[i] - yMean) ** 2;
+  });
+  return {
+    n: pairs.length,
+    median_abs_log10_err: r4(medianOf(errs.map((e) => Math.abs(e)))),
+    mean_log10_err: r4(meanOf(errs)),
+    pct_within_2x: r4(100 * errs.filter((e) => Math.abs(e) <= Math.log10(2)).length / errs.length),
+    r2_log10: r4(ssTot === 0 ? 0 : 1 - ssRes / ssTot),
+  };
 }
 
-// ---------------------------------------------------------------------------
-// Farm playbooks: five concrete steps per category group. Slots: {name},
-// {chain} = first chain, {chains} = chain count, {size} = position-size tier.
-// Every step states a concrete action plus a cost or a duration.
-// ---------------------------------------------------------------------------
-
-type Playbook = [string, string, string, string, string];
-
-const PLAYBOOKS: Record<string, Playbook> = {
-  lending: [
-    'Open {name} on {chain} and supply a blue-chip asset (ETH or a major stablecoin) in a {size} position; the one-time approval plus supply costs about $3–$8 in gas and takes 10 minutes.',
-    'Borrow a small amount against your supply on {name} — keep utilisation under 40% of your collateral — and repay it within the same week; one borrow/repay cycle costs about $5 in gas.',
-    'Repeat the supply-and-borrow loop on {name} every week for 6–10 weeks so your wallet shows a steady history instead of a single burst; budget about $2–$4 in gas per week.',
-    'Use every market {name} lists on {chain}: supply at least two different assets and borrow at least two different assets over the season, roughly 20 minutes of work per market.',
-    'Keep the {size} position open and untouched through any snapshot rumours; check your health factor on {name} weekly for 2 minutes so you are never liquidated before a launch.',
-  ],
-  dexs: [
-    'Swap on {name} on {chain} at least twice a week, rotating pairs each time; a {size} weekly volume target is realistic and each swap costs about $1–$3 in gas and slippage.',
-    'Add a {size} liquidity position on {name} in a major pair and leave it deployed for at least 8 weeks; entering and exiting the position costs about $4–$7 in gas total.',
-    'Trade on each of the {chains} chain deployment(s) of {name} at least once a month so your wallet is active everywhere it operates; bridging a small float costs about $5 per move.',
-    'Use the advanced order types {name} offers (limit orders or TWAP) for at least five orders over the season; each order takes about 5 minutes to place and monitor.',
-    'Keep swapping small amounts on {name} even in quiet weeks — consistency over 6–10 weeks matters more than one huge day; cap total gas spend at about $10 per month.',
-  ],
-  liquidStaking: [
-    'Stake a {size} position through {name} on {chain} and hold the liquid staking token you receive; the stake transaction costs about $3–$6 in gas and takes 10 minutes.',
-    'Use the {name} staking token as collateral or liquidity somewhere it is accepted at least once, so you are a real user of the token and not just a holder; allow 20 minutes for setup.',
-    'Add to your {name} stake in at least four separate tranches spread over 6–10 weeks instead of one lump sum; each top-up costs about $3 in gas.',
-    'Run one full unstake-and-restake cycle on {name} to learn the unbonding flow before any launch; note the unbonding period in days and keep funds you need liquid elsewhere.',
-    'Claim and restake your {name} rewards monthly so compounding is visible on-chain; each claim costs about $2 in gas and takes 5 minutes.',
-  ],
-  bridge: [
-    'Bridge a {size} amount through {name} from {chain} to a second chain at least twice a month; each crossing costs about $2–$6 in fees and takes 10–30 minutes to settle.',
-    'Use {name} in both directions — bridge out and bridge back — at least three times over the season so your routes look like genuine usage, about $4 in fees per round trip.',
-    'Work through the distinct routes {name} supports — it spans {chains} chain(s) — with one small transfer on each route you can fund; a full sweep takes about an hour and roughly $15 in total fees.',
-    'Bridge on different days of the week and at different times on {name} for 6–10 weeks; organic timing patterns take 5 minutes per transfer to maintain.',
-    'Keep a small balance parked on the destination chain after each {name} transfer for at least a week instead of bridging everything straight back; this costs nothing but patience.',
-  ],
-  yield: [
-    'Deposit a {size} position into a flagship vault on {name} on {chain} and leave it for at least 8 weeks; the deposit costs about $4–$8 in gas and takes 10 minutes.',
-    'Spread a second, smaller deposit across another {name} vault or strategy so you hold more than one position; allow 20 minutes and about $5 in gas for the extra deposit.',
-    'Harvest or compound your {name} yield at least once a month rather than letting it sit idle; each compound costs about $2–$3 in gas and takes 5 minutes.',
-    'Rotate a portion of your capital between {name} strategies once per quarter as rates change, and record each move; a rotation takes about 15 minutes and $6 in gas.',
-    'Withdraw a small slice (about 10%) from {name} once mid-season and redeposit it a week later, proving an active full lifecycle; the round trip costs about $5 in gas.',
-  ],
-  derivatives: [
-    'Open a small perpetual or options position on {name} on {chain} with a {size} margin and close it the same day; your first trade takes about 20 minutes and $3 in fees.',
-    'Trade {name} at least twice a week for 6–10 weeks, alternating long and short so your history is two-sided; keep each position small and budget about $10 a month in fees.',
-    'Post margin in more than one collateral type {name} accepts, and move margin between sub-accounts once; setup takes about 15 minutes and costs about $2 in gas.',
-    'Place at least five resting limit orders on {name} that actually fill over the season, not only market orders; each order takes about 5 minutes to place and check.',
-    'Withdraw a portion of your profits or margin from {name} once and deposit again a week later, completing the full account lifecycle; withdrawals settle in about 10–60 minutes.',
-  ],
-  cdp: [
-    'Open a vault on {name} on {chain}: deposit collateral and mint a modest amount of its stablecoin against a {size} position; opening costs about $5–$9 in gas and 15 minutes.',
-    'Keep your {name} vault collateral ratio comfortably above the liquidation line and check it weekly for 2 minutes; top up collateral once during a volatile week to show active management.',
-    'Use the stablecoin you minted from {name} in one other venue (a swap or a deposit) and later buy it back to repay; the round trip takes about 20 minutes and $4 in gas.',
-    'Repay part of your {name} debt at least twice over 6–10 weeks and mint again once, so the vault shows a real borrow-repay rhythm; each adjustment costs about $3 in gas.',
-    'Close the season still holding an open, healthy {name} vault — do not fully exit before a launch snapshot; maintaining it costs only the weekly 2-minute check.',
-  ],
-  rwa: [
-    'Complete onboarding and any KYC {name} requires on {chain} first — set aside about 30 minutes and have ID ready, since verified accounts are the ones a launch can reward.',
-    'Make a first allocation of {size} into a flagship real-world asset product on {name}; funding the position usually settles within 1–3 business days.',
-    'Hold the {name} position through at least two full yield or coupon distributions (typically 2–3 months) instead of exiting after the first payout.',
-    'Add a second, smaller allocation on {name} in a different asset or maturity if one is offered, about 15 minutes of work once onboarding is done.',
-    'Reinvest one distribution from {name} back into the platform rather than withdrawing it, and keep records of each statement; the reinvestment takes about 10 minutes.',
-  ],
-  restaking: [
-    'Restake a {size} position through {name} on {chain} — either native ETH or a liquid staking token; the deposit costs about $4–$7 in gas and takes 15 minutes.',
-    'Delegate or opt into at least one operator or service inside {name} rather than leaving the restake undelegated; choosing and delegating takes about 10 minutes.',
-    'Add to your {name} restake in at least three separate tranches over 6–10 weeks so the position builds gradually; each top-up costs about $3 in gas.',
-    'Claim restaking rewards or points statements on {name} whenever they drop, and restake the proceeds; a claim round costs about $2 in gas and 5 minutes.',
-    'Keep the {name} position restaked through the full season — withdrawals usually have a multi-day unbonding queue, so plan liquidity at least 2 weeks ahead.',
-  ],
-  stakingPool: [
-    'Stake a {size} position with {name} on {chain} and note the lock or unbonding terms before you commit; the stake costs about $3 in gas and takes 10 minutes.',
-    'Pick a validator or pool inside {name} with a solid uptime record, and switch once mid-season if performance lags; a switch takes about 10 minutes.',
-    'Top up your {name} stake at least three times over 6–10 weeks in separate transactions; each top-up costs about $2–$3 in gas.',
-    'Claim staking rewards from {name} monthly and restake at least half of them so compounding shows on-chain; each claim takes about 5 minutes.',
-    'Stay staked with {name} through any launch window — start the unbonding process only after you have confirmed no snapshot is pending, since exit queues run for days.',
-  ],
-  basisTrading: [
-    'Open the core basis position on {name} on {chain} with a {size} allocation: hold the spot leg and the offsetting hedge exactly as the product structures it; setup takes about 25 minutes.',
-    'Rebalance your {name} position whenever the dashboard flags drift, roughly once every 1–2 weeks; each rebalance takes about 10 minutes and a few dollars in fees.',
-    'Add capital to {name} in at least three separate deposits over 6–10 weeks instead of one lump sum, so funding-rate regimes vary across your entries.',
-    'Withdraw a small slice (about 10%) from {name} once to confirm the exit path and timings, then redeposit after a week; the test costs about $4 in fees.',
-    'Track the funding or basis yield {name} reports weekly in a simple spreadsheet — 5 minutes a week — and stay in only while the net yield beats plain staking.',
-  ],
-  curators: [
-    'Allocate a {size} position through a flagship vault or market curated on {name} on {chain}; the deposit costs about $4–$6 in gas and takes 10 minutes.',
-    'Hold positions in at least two different {name} vaults or markets so your exposure is not a single bet; setting up the second position takes about 15 minutes.',
-    'Review the curator updates {name} publishes and rebalance once when allocations shift materially; a rebalance takes about 10 minutes and $3 in gas.',
-    'Keep the {name} allocation deployed for at least 8 weeks, checking the vault health and utilisation weekly in a 2-minute review.',
-    'Withdraw about 10% from {name} once mid-season and redeposit it a week later to complete an active lifecycle; the round trip costs about $5 in gas.',
-  ],
-  cex: [
-    'Create and fully verify an account with {name} — KYC usually takes about 20 minutes — and enable two-factor authentication before depositing anything.',
-    'Deposit a {size} amount to {name} and make at least two spot trades a week for 6–10 weeks; small trades keep fees to roughly $5–$10 a month at typical tiers.',
-    'Use more than one product on {name} — for example spot plus its earn or staking feature — with a small amount in each; setup takes about 15 minutes per product.',
-    'Withdraw a portion of your funds from {name} to your own wallet once a month and deposit again later, proving a genuine two-way flow; each withdrawal costs a few dollars.',
-    'Keep a modest balance on {name} through the season rather than emptying the account after each trade; check the account weekly for about 2 minutes.',
-  ],
-  chain: [
-    'Bridge a {size} float onto the {name} network (starting from {chain} if needed) and keep it there for the season; the bridge costs about $3–$6 and settles in 10–30 minutes.',
-    'Make at least three transactions a week on {name} — swaps, transfers or contract interactions — for 6–10 weeks; on-chain fees are usually under $1 per transaction.',
-    'Use at least three different applications live on {name} (a swap venue, a lending market and one other), spending about 20 minutes exploring each.',
-    'Hold a small balance of the gas asset and one other asset on {name} continuously, topping up monthly; a top-up bridge costs about $3 each time.',
-    'If {name} runs quests, testnet or ecosystem campaigns, complete the current one end to end; most take about 30–45 minutes and a few dollars in fees.',
-  ],
-  launchpad: [
-    'Register and complete any whitelist or KYC steps {name} runs on {chain} before the next sale opens; registration takes about 15 minutes and is often time-limited.',
-    'Commit a {size} amount to at least one launch on {name} this season, even a small tier — participation history is what a launchpad can measure; funding settles in minutes.',
-    'Stake or hold whatever participation asset {name} uses for tiering, if any, for at least 8 weeks; the stake transaction costs about $3 in gas.',
-    'Claim and hold the tokens from your first {name} launch for at least a month instead of selling on day one; claiming costs about $2 in gas.',
-    'Take part in a second {name} launch at least a few weeks after the first so your activity spans the season; each participation takes about 20 minutes end to end.',
-  ],
-  prediction: [
-    'Fund a {size} account balance on {name} on {chain} and place your first position on a liquid market; the deposit and first trade take about 15 minutes.',
-    'Trade at least five different markets on {name} over the season, sizing each position small; each trade takes about 5 minutes and market fees are usually under $1.',
-    'Hold at least one {name} position through to settlement instead of always exiting early, so your history includes resolved markets; settlements pay out automatically.',
-    'Provide liquidity or take the other side of thin markets on {name} where the interface allows it, for at least 4 weeks; check your exposure weekly for 5 minutes.',
-    'Withdraw winnings or idle balance from {name} once and redeposit later in the season, completing the full cycle; a withdrawal settles in about 10–60 minutes.',
-  ],
-  payments: [
-    'Sign up for {name} and complete identity verification — about 20 minutes — then order or activate its payment product if your region is supported.',
-    'Route a {size} total volume of genuine everyday spending or payments through {name} spread over at least 8 weeks, not in a single day.',
-    'Use {name} for at least three different payment types it supports (for example card spend, a transfer and a top-up), each taking only a few minutes.',
-    'Hold a modest working balance with {name} through the season and top it up monthly rather than draining it to zero after every use.',
-    'Refer or transact with at least one other real user of {name} if the product has a social or transfer feature; a first transfer takes about 5 minutes.',
-  ],
-  default: [
-    'Create an account or wallet connection with {name} on {chain} and complete its core action once end to end; the first session takes about 20 minutes and a few dollars in fees.',
-    'Commit a {size} position or balance to {name} and keep it active for at least 8 weeks, checking in weekly for about 5 minutes.',
-    'Use a second feature of {name} beyond the headline one — most products have a secondary market, tier or setting; exploring it takes about 15 minutes.',
-    'Return to {name} at least twice a month for 6–10 weeks with a real transaction each time, so activity is spread across the season; budget about $5 a month in fees.',
-    'Withdraw a small amount from {name} once to verify the exit path, then redeposit it a week later; the round trip takes about 20 minutes in total.',
-  ],
-};
-
-const CATEGORY_TO_PLAYBOOK: Record<string, string> = {
-  'Lending': 'lending',
-  'Dexs': 'dexs',
-  'Liquid Staking': 'liquidStaking',
-  'Bridge': 'bridge',
-  'Cross Chain Bridge': 'bridge',
-  'Canonical Bridge': 'bridge',
-  'Yield': 'yield',
-  'Yield Aggregator': 'yield',
-  'Farm': 'yield',
-  'Leveraged Farming': 'yield',
-  'Derivatives': 'derivatives',
-  'Options': 'derivatives',
-  'Interest Rate Derivatives': 'derivatives',
-  'CDP': 'cdp',
-  'CDP Manager': 'cdp',
-  'RWA': 'rwa',
-  'Restaking': 'restaking',
-  'Liquid Restaking': 'restaking',
-  'Restaked BTC': 'restaking',
-  'Anchor BTC': 'restaking',
-  'Decentralized BTC': 'restaking',
-  'Staking Pool': 'stakingPool',
-  'Basis Trading': 'basisTrading',
-  'Risk Curators': 'curators',
-  'Onchain Capital Allocator': 'curators',
-  'Collateral Management': 'curators',
-  'Collateral Markets': 'curators',
-  'CEX': 'cex',
-  'CeDeFi': 'cex',
-  'Chain': 'chain',
-  'Launchpad': 'launchpad',
-  'Prediction Market': 'prediction',
-  'Payments': 'payments',
-  'Crypto Card Issuer': 'payments',
-};
-
-function farmSteps(p: Protocol): string[] {
-  const key = CATEGORY_TO_PLAYBOOK[p.category ?? ''] ?? 'default';
-  const templates = PLAYBOOKS[key];
-  const chain = p.chains.length > 0 ? p.chains[0] : 'its main chain';
-  const size = sizeTier(p.tvl_usd);
-  return templates.map((t) =>
-    t
-      .replaceAll('{name}', p.name)
-      .replaceAll('{chain}', chain)
-      .replaceAll('{chains}', String(p.chains.length))
-      .replaceAll('{size}', size)
-      .trim(),
-  );
+export interface HeldOutSplit {
+  train_half: string;
+  test_half: string;
+  train_n: number;
+  full_model: ScoreMetrics;
+  baseline_tvl_only: ScoreMetrics;
 }
 
-// ---------------------------------------------------------------------------
-// Board construction
-// ---------------------------------------------------------------------------
+function heldOutValidation(comps: Protocol[], asOf: string): HeldOutSplit[] {
+  const halves: Protocol[][] = [[], []];
+  for (const p of comps) halves[slugHash(p.slug) % 2].push(p);
+  const splits: HeldOutSplit[] = [];
+  for (const trainIdx of [0, 1]) {
+    const train = halves[trainIdx];
+    const test = halves[1 - trainIdx];
+    const fit = fitModel(train, asOf);
+    const full = scorePredictions(test.map((p) => ({
+      pred: predictWith(fit, p, asOf, 4),
+      actual: p.mcap_usd as number,
+    })));
+    const baseline = scorePredictions(test.map((p) => ({
+      pred: p.tvl_usd * fit.global_median,
+      actual: p.mcap_usd as number,
+    })));
+    splits.push({
+      train_half: 'H' + (trainIdx + 1),
+      test_half: 'H' + (2 - trainIdx),
+      train_n: train.length,
+      full_model: full,
+      baseline_tvl_only: baseline,
+    });
+  }
+  return splits;
+}
 
-export interface Row {
+export interface AblationRow {
+  level: string;
+  label: string;
+  median_abs_log10_err: number;
+}
+
+function ablationLadder(comps: Protocol[], fit: Fit, asOf: string): AblationRow[] {
+  const labels = [
+    ['A0', 'global median multiple only'],
+    ['A1', '+ category medians (shrunk when thin)'],
+    ['A2', '+ momentum bucket factor'],
+    ['A3', '+ age bucket factor'],
+    ['A4', 'full model (+ chain-count factor)'],
+  ];
+  return labels.map(([level, label], i) => {
+    const pairs = comps.map((p) => ({
+      pred: i === 0 ? p.tvl_usd * fit.global_median : predictWith(fit, p, asOf, i),
+      actual: p.mcap_usd as number,
+    }));
+    const errs = pairs.map(({ pred, actual }) => Math.abs(Math.log10(pred) - Math.log10(actual)));
+    return { level, label, median_abs_log10_err: r4(medianOf(errs)) };
+  });
+}
+
+// ------------------------------------------------------------------ candidates
+
+export function isCandidate(p: Protocol): boolean {
+  if (p.mcap_usd !== null) return false;
+  if (p.category !== null && EXCLUDED_CATEGORIES.has(p.category)) return false;
+  if (/\b(wrapped|staked|staking)\b/i.test(p.name)) return false;
+  if (/\s(V2|v2|2\.0)$/.test(p.name)) return false;
+  for (const prefix of EXCHANGE_PREFIXES) {
+    if (p.name.startsWith(prefix)) return false;
+  }
+  return true;
+}
+
+// ------------------------------------------------------------------ odds
+
+export interface OddsInfo {
+  odds_pct: number;
+  level: string;
+  bucket_label: string;
+  bucket_n: number;
+  bucket_tokenized: number;
+  backoff_label: string;
+  backoff_rate_pct: number;
+}
+
+function isTokenized(p: Protocol): boolean {
+  return p.mcap_usd !== null;
+}
+
+function launchOdds(
+  candidate: Protocol,
+  all: Protocol[],
+  asOf: string,
+): OddsInfo {
+  const cat = candidate.category;
+  const peers = all.filter((p) => p.category === cat);
+  const tBand = tvlBand(candidate.tvl_usd);
+  const aBand = ageBand(candidate, asOf);
+  const levels: { label: string; rows: Protocol[] }[] = [
+    {
+      label: 'category x TVL band x age band',
+      rows: peers.filter((p) => tvlBand(p.tvl_usd) === tBand && ageBand(p, asOf) === aBand),
+    },
+    {
+      label: 'category x TVL band',
+      rows: peers.filter((p) => tvlBand(p.tvl_usd) === tBand),
+    },
+    { label: 'category', rows: peers },
+    { label: 'global (all protocols)', rows: all },
+  ];
+  const rates = levels.map((l) => ({
+    ...l,
+    tokenized: l.rows.filter(isTokenized).length,
+    rate: l.rows.length === 0 ? 0 : l.rows.filter(isTokenized).length / l.rows.length,
+  }));
+  let used = rates.length - 1;
+  for (let i = 0; i < rates.length; i++) {
+    if (rates[i].rows.length >= ODDS_MIN_BUCKET_N) { used = i; break; }
+  }
+  const chosen = rates[used];
+  const backoff = rates[Math.min(used + 1, rates.length - 1)];
+  const shrunk = (chosen.tokenized + ODDS_PRIOR_WEIGHT * backoff.rate) / (chosen.rows.length + ODDS_PRIOR_WEIGHT);
+  return {
+    odds_pct: Math.round(shrunk * 100),
+    level: chosen.label,
+    bucket_label: (cat ?? '(no category)') + ' · ' + tBand + ' · ' + aBand,
+    bucket_n: chosen.rows.length,
+    bucket_tokenized: chosen.tokenized,
+    backoff_label: backoff.label,
+    backoff_rate_pct: r4(backoff.rate * 100),
+  };
+}
+
+// ------------------------------------------------------------------ farm plans
+
+function positionSize(tvl: number): number {
+  return clamp(Math.round(tvl * 0.0002), 250, 5000);
+}
+
+function coreAction(category: string | null): { verb: string; venue: string } {
+  switch (category) {
+    case 'Lending':
+    case 'Uncollateralized Lending':
+      return { verb: 'supply a blue-chip collateral asset and take a small, well-collateralised borrow against it', venue: 'the main lending market' };
+    case 'Dexs':
+      return { verb: 'provide two-sided liquidity to the deepest pool and route a few real swaps through it', venue: 'the flagship exchange pool' };
+    case 'Yield':
+    case 'Yield Aggregator':
+    case 'Farm':
+    case 'Leveraged Farming':
+      return { verb: 'deposit into the flagship vault and keep the position compounding instead of hopping between vaults', venue: 'the flagship vault' };
+    case 'CDP':
+    case 'CDP Manager':
+    case 'Algo-Stables':
+    case 'Dual-Token Stablecoin':
+      return { verb: 'open a small collateralised debt position and mint against it, keeping the health factor comfortably high', venue: 'the main vault market' };
+    case 'Derivatives':
+    case 'Options':
+    case 'Options Vault':
+      return { verb: 'trade a small recurring size on the main market so the account builds a genuine volume history', venue: 'the main derivatives market' };
+    case 'Launchpad':
+      return { verb: 'stake or hold the required balance and take part in one live launch allocation round', venue: 'the launchpad' };
+    default:
+      return { verb: 'use the core product the way a real user would, with a real balance at stake', venue: 'the main product interface' };
+  }
+}
+
+export interface FarmStep {
+  text: string;
+  cost_usd: number;
+  duration: string;
+}
+
+export function farmPlan(p: Protocol): FarmStep[] {
+  const chain = (p.chains && p.chains[0]) || 'its main chain';
+  const chainCount = (p.chains || []).length || 1;
+  const pos = positionSize(p.tvl_usd);
+  const { verb, venue } = coreAction(p.category);
+  const gas = 6 + 4 * chainCount;
+  const steps: FarmStep[] = [
+    {
+      text: `Create a fresh wallet for ${p.name} and bridge $${pos} of working capital to ${chain}, keeping that wallet dedicated to this protocol alone — about $${gas} in bridge and gas fees, 30 minutes.`,
+      cost_usd: gas,
+      duration: '30 minutes',
+    },
+    {
+      text: `Make the first real deposit with ${p.name}: ${verb} on ${chain} via ${venue}, sized at the full $${pos} — about $${Math.round(pos * 0.01) + 4} in swap and approval fees, 20 minutes.`,
+      cost_usd: Math.round(pos * 0.01) + 4,
+      duration: '20 minutes',
+    },
+    {
+      text: `Repeat the core ${p.name} action weekly for six weeks — top up, rebalance or roll the position instead of depositing once and going idle — about $${5 + chainCount * 2} in gas per week, 15 minutes a week.`,
+      cost_usd: (5 + chainCount * 2) * 6,
+      duration: '15 minutes a week for 6 weeks',
+    },
+    {
+      text: `Use one secondary ${p.name} feature on ${chain} (a second market or vault among its ${chainCount} listed chains) so the account goes beyond the single most farmed route — about $${Math.round(pos * 0.005) + 5} in fees, one hour.`,
+      cost_usd: Math.round(pos * 0.005) + 5,
+      duration: '1 hour',
+    },
+    {
+      text: `Stay active until any ${p.name} snapshot or points season closes: check weekly, claim and restake rewards, and keep at least half the original $${pos} in place — about $8 in gas a month, 10 minutes a week.`,
+      cost_usd: 24,
+      duration: '10 minutes a week, ongoing',
+    },
+  ];
+  return steps.map((s) => ({ ...s, text: s.text.trim() }));
+}
+
+// ------------------------------------------------------------------ the board
+
+export interface BoardRow {
   slug: string;
   name: string;
   rank: number;
   implied_value_usd: number;
   farm_steps: string[];
-  category: string;
+  category: string | null;
   tvl_usd: number;
   change_7d: number | null;
-  chains_count: number;
-  chains: string[];
-  listed_at: string | null;
-  multiple: number;
+  odds_pct: number;
   band_low_usd: number;
   band_high_usd: number;
   verdict: string;
+  farm_cost_usd: number;
+  chains: string[];
+  listed_at: string | null;
+  age_years: number | null;
   watchlist: boolean;
-  stats_source: string;
-  stats_n: number;
-  momentum: number;
+  category_multiple: number;
+  momentum_factor: number;
   age_factor: number;
-  chains_factor: number;
+  chain_factor: number;
+  odds: OddsInfo;
+  farm_plan: FarmStep[];
+  verdict_reason: string;
 }
 
-interface CandidateCalc {
-  p: Protocol;
-  multiple: number;
-  bandLowMult: number;
-  bandHighMult: number;
-  momentum: number;
-  age: number;
-  chainsF: number;
-  stats: Stats;
-  statsSource: string;
-  variants: number[];
-  full: number;
-  bandLow: number;
-  bandHigh: number;
+export interface BoardResult {
+  rows: BoardRow[];
+  model: Record<string, unknown>;
+  integrity: Record<string, unknown>;
 }
 
-export function buildBoard(snapshot: Snapshot) {
-  const { protocols, watchlist, as_of } = snapshot;
-  const watch = new Set(watchlist);
+export function buildBoard(snapshot: Snapshot): BoardResult {
+  const asOf = snapshot.as_of;
+  const all = snapshot.protocols;
+  const comparables = all.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const fit = fitModel(comparables, asOf);
+  const heldOut = heldOutValidation(comparables, asOf);
+  const ablation = ablationLadder(comparables, fit, asOf);
 
-  const comparables = protocols.filter(
-    (p) => p.mcap_usd !== null && p.tvl_usd > 0,
-  );
-  const globalStats = quantileStats(
-    comparables.map((p) => (p.mcap_usd as number) / p.tvl_usd),
-  );
+  const watchlist = new Set(snapshot.watchlist);
+  const candidates = all.filter(isCandidate);
 
-  const byCategory = new Map<string, number[]>();
-  for (const p of comparables) {
-    const cat = p.category ?? 'Uncategorised';
-    const arr = byCategory.get(cat) ?? [];
-    arr.push((p.mcap_usd as number) / p.tvl_usd);
-    byCategory.set(cat, arr);
-  }
-  const categoryStats = new Map<string, Stats>();
-  for (const [cat, vals] of byCategory) {
-    categoryStats.set(cat, quantileStats(vals));
-  }
-
-  const statsFor = (p: Protocol): { stats: Stats; source: string } => {
-    const cat = p.category ?? 'Uncategorised';
-    const cs = categoryStats.get(cat);
-    if (cs && cs.n >= MIN_CATEGORY_COMPARABLES) {
-      return { stats: cs, source: cat };
+  const rows: BoardRow[] = candidates.map((p) => {
+    const cat = categoryFit(fit, p.category);
+    const mF = factorFor(fit.momentum, momentumBucket(p.change_7d));
+    const aF = factorFor(fit.age, ageBucket(p, asOf));
+    const cF = factorFor(fit.chains, chainBucket(p));
+    const factors = mF * aF * cF;
+    const implied = Math.round(p.tvl_usd * cat.median * factors);
+    const bandLow = Math.round(p.tvl_usd * cat.p25 * factors);
+    const bandHigh = Math.round(p.tvl_usd * cat.p75 * factors);
+    const odds = launchOdds(p, all, asOf);
+    const plan = farmPlan(p);
+    const farmCost = plan.reduce((s, x) => s + x.cost_usd, 0);
+    let verdict = 'SKIP';
+    let reason = 'Below the THIN bar on odds, implied value, or both — capital earns more elsewhere on this board.';
+    if (odds.odds_pct >= VERDICT.farm_min_odds_pct
+      && implied >= VERDICT.farm_min_implied_usd
+      && implied / farmCost >= VERDICT.farm_min_value_per_cost) {
+      verdict = 'FARM';
+      reason = `Launch odds ${odds.odds_pct}% and $${implied.toLocaleString('en-US')} implied clear the FARM bar, at $${farmCost} of total farm cost.`;
+    } else if (odds.odds_pct >= VERDICT.thin_min_odds_pct && implied >= VERDICT.thin_min_implied_usd) {
+      verdict = 'THIN';
+      reason = `Clears the THIN bar (odds ${odds.odds_pct}%, implied $${implied.toLocaleString('en-US')}) but not FARM — a small position only.`;
     }
-    return { stats: globalStats, source: 'global fallback' };
-  };
-
-  const candidates = protocols.filter(
-    (p) => p.gecko_id === null && p.symbol === null,
-  );
-
-  const calcs: CandidateCalc[] = candidates.map((p) => {
-    const { stats, source } = statsFor(p);
-    const momentum = momentumFactor(p.change_7d);
-    const age = ageFactor(p.listed_at, as_of);
-    const chainsF = chainsFactor(p.chains.length);
-    const adj = momentum * age * chainsF;
-    const variants = [
-      Math.max(1, Math.round(p.tvl_usd)),
-      Math.max(1, Math.round(p.tvl_usd * stats.median)),
-      Math.max(1, Math.round(p.tvl_usd * stats.median * momentum)),
-      Math.max(1, Math.round(p.tvl_usd * stats.median * momentum * age)),
-      Math.max(1, Math.round(p.tvl_usd * stats.median * adj)),
-    ];
-    const full = variants[4];
-    let bandLow = Math.max(
-      1,
-      Math.round(p.tvl_usd * stats.p25 * adj),
-    );
-    let bandHigh = Math.max(
-      1,
-      Math.round(p.tvl_usd * stats.p75 * adj),
-    );
-    if (bandLow > full) bandLow = full;
-    if (bandHigh < full) bandHigh = full;
+    const age = ageYears(p, asOf);
     return {
-      p,
-      multiple: stats.median,
-      bandLowMult: stats.p25,
-      bandHighMult: stats.p75,
-      momentum,
-      age,
-      chainsF,
-      stats,
-      statsSource: source,
-      variants,
-      full,
-      bandLow,
-      bandHigh,
+      slug: p.slug,
+      name: p.name,
+      rank: 0,
+      implied_value_usd: implied,
+      farm_steps: plan.map((s) => s.text),
+      category: p.category,
+      tvl_usd: p.tvl_usd,
+      change_7d: p.change_7d,
+      odds_pct: odds.odds_pct,
+      band_low_usd: bandLow,
+      band_high_usd: bandHigh,
+      verdict,
+      farm_cost_usd: farmCost,
+      chains: p.chains || [],
+      listed_at: p.listed_at,
+      age_years: age === null ? null : r4(age),
+      watchlist: watchlist.has(p.slug),
+      category_multiple: cat.median,
+      momentum_factor: mF,
+      age_factor: aF,
+      chain_factor: cF,
+      odds,
+      farm_plan: plan,
+      verdict_reason: reason,
     };
   });
 
-  const sorted = [...calcs].sort((a, b) => {
-    if (b.full !== a.full) return b.full - a.full;
-    return a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0;
-  });
+  rows.sort((a, b) => (b.implied_value_usd - a.implied_value_usd) || (a.slug < b.slug ? -1 : 1));
+  rows.forEach((row, i) => { row.rank = i + 1; });
 
-  const rows: Row[] = sorted.map((c, i) => {
-    const m = c.full / c.p.tvl_usd;
-    return {
-      slug: c.p.slug,
-      name: c.p.name,
-      rank: i + 1,
-      implied_value_usd: c.full,
-      farm_steps: farmSteps(c.p),
-      category: c.p.category ?? 'Uncategorised',
-      tvl_usd: c.p.tvl_usd,
-      change_7d: c.p.change_7d,
-      chains_count: c.p.chains.length,
-      chains: [...c.p.chains],
-      listed_at: c.p.listed_at,
-      multiple: round4(c.multiple),
-      band_low_usd: c.bandLow,
-      band_high_usd: c.bandHigh,
-      verdict: m >= 0.8 ? 'FARM' : m >= 0.25 ? 'THIN' : 'SKIP',
-      watchlist: watch.has(c.p.slug),
-      stats_source: c.statsSource,
-      stats_n: c.stats.n,
-      momentum: round4(c.momentum),
-      age_factor: round4(c.age),
-      chains_factor: round4(c.chainsF),
-    };
-  });
-
-  // Ablation ladder: each variant against the full model (A4).
-  const fullTop40 = new Set(rows.slice(0, 40).map((r) => r.slug));
-  const labels = [
-    'TVL alone',
-    '+ category multiple',
-    '+ momentum',
-    '+ token-free age',
-    '+ chain reach (full model)',
-  ];
-  const ablation = labels.map((label, v) => {
-    let shiftSum = 0;
-    const variantSorted = [...calcs]
-      .map((c) => ({ slug: c.p.slug, val: c.variants[v] }))
-      .sort((a, b) => {
-        if (b.val !== a.val) return b.val - a.val;
-        return a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
-      });
-    for (const c of calcs) {
-      shiftSum += Math.abs(Math.log(c.variants[v] / c.full));
-    }
-    const top = new Set(variantSorted.slice(0, 40).map((x) => x.slug));
-    let overlap = 0;
-    for (const s of top) if (fullTop40.has(s)) overlap++;
-    return {
-      step: 'A' + v,
-      label,
-      mean_abs_log_shift: round3(shiftSum / calcs.length),
-      top40_overlap: overlap,
-    };
-  });
-
-  const catStatsOut: Record<string, Stats> = {};
-  for (const cat of [...categoryStats.keys()].sort()) {
-    const s = categoryStats.get(cat) as Stats;
-    catStatsOut[cat] = {
-      median: round4(s.median),
-      p25: round4(s.p25),
-      p75: round4(s.p75),
-      n: s.n,
-    };
+  // ---------------------------------------------------------- integrity
+  const covered = snapshot.watchlist.filter((slug) => rows.some((r) => r.slug === slug)).length;
+  if (covered !== snapshot.watchlist.length) {
+    throw new Error(`watchlist coverage ${covered}/${snapshot.watchlist.length}: a watchlist slug is missing from the board`);
   }
+  let monotone = true;
+  for (let i = 1; i < rows.length; i++) {
+    if (rows[i].implied_value_usd > rows[i - 1].implied_value_usd) monotone = false;
+  }
+  if (!monotone) throw new Error('board is not monotone in implied value by rank');
+  let stepsOk = true;
+  for (const row of rows) {
+    if (row.farm_steps.length !== 5) stepsOk = false;
+    for (const step of row.farm_steps) {
+      const len = step.trim().length;
+      if (len < 20 || len > 600) stepsOk = false;
+    }
+  }
+  if (!stepsOk) throw new Error('a farm step falls outside 20-600 trimmed characters');
 
-  const covered = rows.filter((r) => r.watchlist).length;
-  const data = {
-    as_of,
-    floor_usd: snapshot.floor_usd,
-    counts: {
-      scanned: protocols.length,
-      tokenised: protocols.length - candidates.length,
-      ranked: rows.length,
-      watchlist: watchlist.length,
-      watchlist_covered: covered,
-    },
-    model: {
-      momentum_per_pct: MOMENTUM_PER_PCT,
-      momentum_clamp: [MOMENTUM_MIN, MOMENTUM_MAX],
-      age_per_year: AGE_PER_YEAR,
-      age_max_years: AGE_MAX_YEARS,
-      chain_per_extra: CHAIN_PER_EXTRA,
-      chain_max_extra: CHAIN_MAX_EXTRA,
-      min_category_comparables: MIN_CATEGORY_COMPARABLES,
-      global: {
-        median: round4(globalStats.median),
-        p25: round4(globalStats.p25),
-        p75: round4(globalStats.p75),
-        n: globalStats.n,
-      },
-    },
-    category_stats: catStatsOut,
+  const model = {
+    formula: 'implied value = TVL x category multiple x momentum factor x age factor x chain factor',
+    global_median: fit.global_median,
+    global_p25: fit.global_p25,
+    global_p75: fit.global_p75,
+    comparables_used: comparables.length,
+    median_convention: 'upper middle element of the sorted ratios (index floor(n/2))',
+    factor_clamp: [FACTOR_MIN, FACTOR_MAX],
+    category_prior_weight: CATEGORY_PRIOR_WEIGHT,
+    categories: fit.categories,
+    momentum_factors: fit.momentum,
+    age_factors: fit.age,
+    chain_factors: fit.chains,
+    held_out: heldOut,
     ablation,
-    rows,
+    verdict_thresholds: VERDICT,
+    odds_method: {
+      min_bucket_n: ODDS_MIN_BUCKET_N,
+      prior_weight: ODDS_PRIOR_WEIGHT,
+      levels: ['category x TVL band x age band', 'category x TVL band', 'category', 'global (all protocols)'],
+      note: 'odds = share of peer protocols that already record a token, in the finest bucket holding at least 8 peers, shrunk toward the next coarser rate with a prior weight of 4',
+    },
   };
 
-  return { rows, data };
+  const integrity = {
+    as_of: asOf,
+    source: snapshot.source,
+    floor_usd: snapshot.floor_usd,
+    protocols_scanned: all.length,
+    candidates_ranked: rows.length,
+    watchlist_total: snapshot.watchlist.length,
+    watchlist_covered: covered,
+    comparables_used: comparables.length,
+    monotone_verified: monotone,
+    farm_steps_verified: stepsOk,
+    held_out_splits: heldOut.length,
+  };
+
+  return { rows, model, integrity };
 }

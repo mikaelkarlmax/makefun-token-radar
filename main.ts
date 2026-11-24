@@ -1,107 +1,106 @@
-// Token Launch Radar — entrypoint.
-// Reads a sealed snapshot, builds the ranked board, and writes the dossier
-// bundle (board.json, data.js, dashboard/, screenshots/, dossier.json).
+// Token Launch Radar v2 — entrypoint.
+// Reads the sealed snapshot, fits the model, ranks the pre-token board and
+// writes the full output bundle: board.json for the gate, data.js for the
+// dashboard, copies of dashboard/ and screenshots/, and dossier.json built
+// with the vendor library exactly as the scorer rebuilds it.
 import { buildDossier } from './vendor/makefun-board.ts';
 import { buildBoard } from './lib/model.ts';
 import {
-  readFileSync,
-  writeFileSync,
+  copyFileSync,
   mkdirSync,
   readdirSync,
-  copyFileSync,
+  readFileSync,
   statSync,
+  writeFileSync,
 } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-function parseArgs(argv: string[]): { input: string; output: string } {
-  let input = '/input';
-  let output = process.env.MAKEFUN_OUTPUT_DIR || '/output';
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--input' && i + 1 < argv.length) input = argv[++i];
-    else if (argv[i] === '--output' && i + 1 < argv.length) output = argv[++i];
-  }
-  return { input, output };
+interface CliOptions {
+  input: string;
+  output: string;
 }
 
-function copyDirFiles(src: string, dest: string): string[] {
-  mkdirSync(dest, { recursive: true });
-  const names = readdirSync(src).sort();
-  const copied: string[] = [];
-  for (const name of names) {
-    const from = join(src, name);
+function readOptions(argv: string[]): CliOptions {
+  const opts: CliOptions = {
+    input: '/input',
+    output: process.env.MAKEFUN_OUTPUT_DIR || '/output',
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (flag === '--input' && argv[i + 1]) opts.input = argv[++i];
+    else if (flag === '--output' && argv[i + 1]) opts.output = argv[++i];
+  }
+  return opts;
+}
+
+function snapshotFile(input: string): string {
+  return statSync(input).isDirectory() ? join(input, 'snapshot.json') : input;
+}
+
+function copyFlat(sourceDir: string, targetDir: string): string[] {
+  mkdirSync(targetDir, { recursive: true });
+  const names: string[] = [];
+  for (const name of readdirSync(sourceDir).sort()) {
+    const from = join(sourceDir, name);
     if (statSync(from).isFile()) {
-      copyFileSync(from, join(dest, name));
-      copied.push(name);
+      copyFileSync(from, join(targetDir, name));
+      names.push(name);
     }
   }
-  return copied;
+  return names;
 }
 
-function main(): void {
-  const { input, output } = parseArgs(process.argv.slice(2));
-  const here = dirname(fileURLToPath(import.meta.url));
+function run(): void {
+  const opts = readOptions(process.argv.slice(2));
+  const repoRoot = dirname(fileURLToPath(import.meta.url));
 
-  let snapshotPath = input;
-  if (statSync(input).isDirectory()) snapshotPath = join(input, 'snapshot.json');
-  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8'));
+  const snapshot = JSON.parse(readFileSync(snapshotFile(opts.input), 'utf8'));
+  const board = buildBoard(snapshot);
 
-  const { rows, data } = buildBoard(snapshot);
+  mkdirSync(opts.output, { recursive: true });
 
-  mkdirSync(output, { recursive: true });
+  // board.json — the gate's rows: the required fields plus the radar extras.
+  const boardRows = board.rows.map((r) => ({
+    slug: r.slug,
+    name: r.name,
+    rank: r.rank,
+    implied_value_usd: r.implied_value_usd,
+    farm_steps: r.farm_steps,
+    category: r.category,
+    tvl_usd: r.tvl_usd,
+    change_7d: r.change_7d,
+    odds_pct: r.odds_pct,
+    band_low_usd: r.band_low_usd,
+    band_high_usd: r.band_high_usd,
+    verdict: r.verdict,
+    farm_cost_usd: r.farm_cost_usd,
+  }));
+  writeFileSync(join(opts.output, 'board.json'), JSON.stringify({ rows: boardRows }) + '\n');
 
-  // 1. board.json
-  writeFileSync(join(output, 'board.json'), JSON.stringify({ rows }) + '\n');
+  // data.js — everything the dashboard renders: integrity, model, full rows.
+  const payload = {
+    integrity: board.integrity,
+    model: board.model,
+    rows: board.rows,
+  };
+  writeFileSync(join(opts.output, 'data.js'), 'window.RADAR_DATA = ' + JSON.stringify(payload) + ';\n');
 
-  // 2. data.js at the output root
-  writeFileSync(
-    join(output, 'data.js'),
-    'window.RADAR_DATA = ' + JSON.stringify(data) + ';\n',
-  );
+  // dashboard/ and screenshots/ travel with the output.
+  copyFlat(join(repoRoot, 'dashboard'), join(opts.output, 'dashboard'));
+  copyFlat(join(repoRoot, 'screenshots'), join(opts.output, 'screenshots'));
 
-  // 3. dashboard/
-  copyDirFiles(join(here, 'dashboard'), join(output, 'dashboard'));
+  // dossier.json last: it is built from the dashboard and screenshots above.
+  const dossier = buildDossier(opts.output, { text_max_bytes: 65536 });
+  writeFileSync(join(opts.output, 'dossier.json'), dossier);
 
-  // 4. screenshots/
-  const shots = copyDirFiles(
-    join(here, 'screenshots'),
-    join(output, 'screenshots'),
-  );
-  const imageShots = shots.filter((n) =>
-    /\.(png|jpe?g|webp|gif)$/i.test(n),
-  );
-
-  // 5. dossier.json LAST — only when at least one screenshot exists, because
-  // buildDossier refuses an empty screenshots directory.
-  let dossierNote = 'dossier skipped (no screenshots yet)';
-  if (imageShots.length >= 1) {
-    writeFileSync(
-      join(output, 'dossier.json'),
-      buildDossier(output, {
-        text_max_bytes: 65536,
-        screenshots: { max: 4, max_bytes: 524288 },
-        dashboard: { max_files: 400, max_bytes: 4194304 },
-      }),
-    );
-    dossierNote = 'dossier.json written';
-  }
-
-  const totalImplied = rows.reduce((s, r) => s + r.implied_value_usd, 0);
+  const farmCount = board.rows.filter((r) => r.verdict === 'FARM').length;
   console.log(
-    'Token Launch Radar: ranked ' +
-      rows.length +
-      ' pre-token protocols (' +
-      data.counts.watchlist_covered +
-      '/' +
-      data.counts.watchlist +
-      ' watchlist covered), total implied $' +
-      totalImplied.toLocaleString('en-US') +
-      ' -> ' +
-      output +
-      ' (' +
-      dossierNote +
-      ')',
+    'Token Launch Radar v2: ' + board.rows.length + ' candidates ranked, ' +
+    farmCount + ' FARM verdicts, watchlist ' +
+    String(board.integrity.watchlist_covered) + '/' + String(board.integrity.watchlist_total) +
+    ' covered -> ' + opts.output,
   );
 }
 
-main();
+run();
